@@ -24,6 +24,8 @@ open class HTTPFileProvider: NSObject, FileProviderBasicRemote, FileProviderOper
         }
     }
     
+    lazy var long_operation_queue: OperationQueue = OperationQueue()
+    
     open weak var delegate: FileProviderDelegate?
     open var credential: URLCredential? {
         didSet {
@@ -61,15 +63,31 @@ open class HTTPFileProvider: NSObject, FileProviderBasicRemote, FileProviderOper
         }
     }
     
-    fileprivate var _longpollSession: URLSession?
+    fileprivate var _longpollSession: URLSession!
     /// This session has extended timeout up to 10 minutes, suitable for monitoring.
     internal var longpollSession: URLSession {
-        if _longpollSession == nil {
-            let config = URLSessionConfiguration.default
-            config.timeoutIntervalForRequest = 600
-            _longpollSession = URLSession(configuration: config, delegate: nil, delegateQueue: nil)
+        get {
+            if _longpollSession == nil {
+                let config = URLSessionConfiguration.background(withIdentifier: "com.read.back.task")
+                config.urlCache = cache
+                config.requestCachePolicy = .returnCacheDataElseLoad
+                long_operation_queue.maxConcurrentOperationCount = 3
+                _longpollSession = URLSession(configuration: config, delegate: sessionDelegate as URLSessionDelegate?, delegateQueue: self.long_operation_queue)
+                _longpollSession.sessionDescription = UUID().uuidString
+                initEmptySessionHandler(_longpollSession.sessionDescription!)
+            }
+            return _longpollSession
         }
-        return _longpollSession!
+        
+        set {
+            assert(newValue.delegate is SessionDelegate, "session instances should have a SessionDelegate instance as delegate.")
+            _longpollSession = newValue
+            if _longpollSession.sessionDescription?.isEmpty ?? true {
+                _longpollSession.sessionDescription = UUID().uuidString
+            }
+            self.sessionDelegate = newValue.delegate as? SessionDelegate
+            initEmptySessionHandler(_longpollSession.sessionDescription!)
+        }
     }
     
     #if os(macOS) || os(iOS) || os(tvOS)
@@ -108,6 +126,9 @@ open class HTTPFileProvider: NSObject, FileProviderBasicRemote, FileProviderOper
     deinit {
         if let sessionuuid = _session?.sessionDescription {
             removeSessionHandler(for: sessionuuid)
+        }
+        if let longsuid = _longpollSession?.sessionDescription {
+            removeSessionHandler(for: longsuid)
         }
         
         if fileProviderCancelTasksOnInvalidating {
@@ -591,7 +612,7 @@ open class HTTPFileProvider: NSObject, FileProviderBasicRemote, FileProviderOper
         progress.kind = .file
         progress.setUserInfoObject(Progress.FileOperationKind.downloading, forKey: .fileOperationKindKey)
         
-        let task = session.dataTask(with: request)
+        let task = longpollSession.dataTask(with: request)
         if let responseHandler = responseHandler {
             responseCompletionHandlersForTasks[session.sessionDescription!]?[task.taskIdentifier] = { response in
                 responseHandler(response)
@@ -676,15 +697,15 @@ open class HTTPFileProvider: NSObject, FileProviderBasicRemote, FileProviderOper
         progress.kind = .file
         progress.setUserInfoObject(Progress.FileOperationKind.downloading, forKey: .fileOperationKindKey)
         
-        let task = session.downloadTask(with: request)
-        completionHandlersForTasks[session.sessionDescription!]?[task.taskIdentifier] = { error in
+        let task = longpollSession.downloadTask(with: request)
+        completionHandlersForTasks[longpollSession.sessionDescription!]?[task.taskIdentifier] = { error in
             if let error = error {
                 progress.cancel()
                 completionHandler(nil, error)
                 self.delegateNotify(operation, error: error)
             }
         }
-        downloadCompletionHandlersForTasks[session.sessionDescription!]?[task.taskIdentifier] = { tempURL in
+        downloadCompletionHandlersForTasks[longpollSession.sessionDescription!]?[task.taskIdentifier] = { tempURL in
             guard let httpResponse = task.response as? HTTPURLResponse , httpResponse.statusCode < 300 else {
                 let code = FileProviderHTTPErrorCode(rawValue: (task.response as? HTTPURLResponse)?.statusCode ?? -1)
                 let errorData : Data? = try? Data(contentsOf: tempURL)
